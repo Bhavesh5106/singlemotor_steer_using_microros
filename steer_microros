@@ -1,0 +1,174 @@
+#include <Arduino.h>
+#include <micro_ros_platformio.h>
+#include <ESP32Encoder.h>
+
+#include <rcl/rcl.h>
+#include <rclc/rclc.h>
+#include <rclc/executor.h>
+
+#include <std_msgs/msg/float32.h>
+
+#define FR_Dir 5
+#define FR_PWM 17
+#define FR_ENC_A 33
+#define FR_ENC_B 32
+#define FR_CHL 0
+
+#define FR_COUNTS_PER_REV 201778.0f
+ESP32Encoder FR;
+
+// micro-ROS Entities
+rcl_node_t node;
+rcl_subscription_t subscriber;
+rcl_publisher_t publisher;
+rclc_executor_t executor;
+rclc_support_t support;
+rcl_allocator_t allocator;
+
+std_msgs__msg__Float32 sub_msg;
+std_msgs__msg__Float32 pub_msg;
+
+// Motion Control State
+float target_angle = 0.0f;
+float current_angle = 0.0f;
+int64_t target_counts = 0;
+bool motor_active = false;
+int motor_dir = 0;
+
+unsigned long last_pub_time = 0;
+const unsigned long PUB_INTERVAL_MS = 20; // 50 Hz telemetry
+
+void steer(int dir_pin, int dir_val, int pwm_channel)
+{
+    digitalWrite(dir_pin, dir_val);
+    ledcWrite(pwm_channel, 100);
+}
+
+void stop_motor(int pwm_channel)
+{
+    ledcWrite(pwm_channel, 0);
+}
+
+// Convert encoder counts back into degrees
+float get_current_angle_deg()
+{
+    int64_t counts = FR.getCount();
+    return ((float)counts / FR_COUNTS_PER_REV) * 360.0f;
+}
+
+// Subscriber callback triggered when target_angle receives a new value
+void cmd_callback(const void *msgin)
+{
+    const std_msgs__msg__Float32 *msg = (const std_msgs__msg__Float32 *)msgin;
+    
+    target_angle = msg->data;
+
+    // Reset encoder count to start relative rotation
+    FR.clearCount();
+
+    // Direction selection:
+    // Negative angle: clockwise (dir = 1)
+    // Positive angle: counter-clockwise (dir = 0)
+    if (target_angle < 0.0f)
+    {
+        motor_dir = 1;
+    }
+    else
+    {
+        motor_dir = 0;
+    }
+
+    target_counts = (int64_t)((abs(target_angle) / 360.0f) * FR_COUNTS_PER_REV);
+    
+    if (target_counts > 0)
+    {
+        steer(FR_Dir, motor_dir, FR_CHL);
+        motor_active = true;
+    }
+    else
+    {
+        stop_motor(FR_CHL);
+        motor_active = false;
+    }
+}
+
+// Non-blocking position monitor
+void update_motor_control()
+{
+    current_angle = get_current_angle_deg();
+
+    if (motor_active)
+    {
+        // Check if encoder count reaches target threshold
+        if (abs(FR.getCount()) >= target_counts)
+        {
+            stop_motor(FR_CHL);
+            motor_active = false;
+        }
+    }
+}
+
+void setup()
+{
+    // Motor Pin Setup
+    pinMode(FR_Dir, OUTPUT);
+    pinMode(FR_PWM, OUTPUT);
+    ledcSetup(FR_CHL, 20000, 8);
+    ledcAttachPin(FR_PWM, FR_CHL);
+
+    // Encoder Setup
+    ESP32Encoder::useInternalWeakPullResistors = puType::up;
+    FR.attachHalfQuad(FR_ENC_A, FR_ENC_B);
+    FR.clearCount();
+
+    // micro-ROS Transport
+    Serial.begin(115200);
+    set_microros_serial_transports(Serial);
+    delay(2000);
+
+    allocator = rcl_get_default_allocator();
+    rclc_support_init(&support, 0, NULL, &allocator);
+    rclc_node_init_default(&node, "steer_fr_node", "", &support);
+
+    // Target Command Subscriber
+    rclc_subscription_init_default(
+        &subscriber,
+        &node,
+        ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, Float32),
+        "/steer_motor/target_angle");
+
+    // Real-time Current Angle Publisher
+    rclc_publisher_init_default(
+        &publisher,
+        &node,
+        ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, Float32),
+        "/steer_motor/current_angle");
+
+    // Executor Initialization (1 handle for subscription)
+    rclc_executor_init(&executor, &support.context, 1, &allocator);
+    rclc_executor_add_subscription(
+        &executor,
+        &subscriber,
+        &sub_msg,
+        &cmd_callback,
+        ON_NEW_DATA);
+}
+
+void loop()
+{
+    // Handle incoming ROS 2 messages
+    rclc_executor_spin_some(&executor, RCL_MS_TO_NS(10));
+
+    // Monitor encoder counts and stop motor when reached
+    update_motor_control();
+
+    // Stream current angle back to ROS 2
+    if (millis() - last_pub_time >= PUB_INTERVAL_MS)
+    {
+        last_pub_time = millis();
+        pub_msg.data = current_angle;
+        rcl_publish(&publisher, &pub_msg, NULL);
+    }
+
+    delay(5);
+}
